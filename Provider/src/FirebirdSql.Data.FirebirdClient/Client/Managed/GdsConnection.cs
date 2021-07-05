@@ -141,10 +141,12 @@ namespace FirebirdSql.Data.Client.Managed
 				var protocols = ProtocolsSupported.Get(_compression);
 				await Xdr.Write(protocols.Count(), async).ConfigureAwait(false);
 
-				var (userIdentificationData, srp, sspi) = UserIdentificationData();
+				var srp256 = new Srp256Client();
+				var srp = new SrpClient();
+				var sspi = new SspiHelper();
 				using (sspi)
 				{
-					await Xdr.WriteBuffer(userIdentificationData, async).ConfigureAwait(false);
+					await Xdr.WriteBuffer(UserIdentificationData(srp256, srp, sspi), async).ConfigureAwait(false);
 
 					var priority = 0;
 					foreach (var protocol in protocols)
@@ -185,25 +187,39 @@ namespace FirebirdSql.Data.Client.Managed
 							var acceptPluginName = await Xdr.ReadString(async).ConfigureAwait(false);
 							var isAuthenticated = await Xdr.ReadBoolean(async).ConfigureAwait(false);
 							var serverKeys = await Xdr.ReadBuffer(async).ConfigureAwait(false);
-							if (!isAuthenticated)
-							{
-								switch (acceptPluginName)
-								{
-									case SrpClient.PluginName:
-										AuthData = Encoding.ASCII.GetBytes(srp.ClientProof(NormalizeLogin(_userID), Password, serverData).ToHexString());
-										break;
-									case SspiHelper.PluginName:
-										AuthData = sspi.GetClientSecurity(serverData);
-										break;
-									default:
-										throw new ArgumentOutOfRangeException(nameof(acceptPluginName), $"{nameof(acceptPluginName)}={acceptPluginName}");
-								}
-							}
 
 							if (_compression)
 							{
 								// after reading before writing
 								_firebirdNetworkHandlingWrapper.StartCompression();
+							}
+
+							var sessionKey = default(byte[]);
+							var sessionKeyName = default(string);
+							if (!isAuthenticated)
+							{
+								if (acceptPluginName.Equals(srp256.PluginName, StringComparison.Ordinal))
+								{
+									AuthData = Encoding.ASCII.GetBytes(srp256.ClientProof(NormalizeLogin(_userID), Password, serverData).ToHexString());
+									sessionKey = srp256.SessionKey;
+									sessionKeyName = srp256.SessionKeyName;
+								}
+								else if (acceptPluginName.Equals(srp.PluginName, StringComparison.Ordinal))
+								{
+									AuthData = Encoding.ASCII.GetBytes(srp.ClientProof(NormalizeLogin(_userID), Password, serverData).ToHexString());
+									sessionKey = srp.SessionKey;
+									sessionKeyName = srp.SessionKeyName;
+								}
+								else if (acceptPluginName.Equals(SspiHelper.PluginName, StringComparison.Ordinal))
+								{
+									AuthData = sspi.GetClientSecurity(serverData);
+									sessionKey = default;
+									sessionKeyName = default;
+								}
+								else
+								{
+									throw new ArgumentOutOfRangeException(nameof(acceptPluginName), $"{nameof(acceptPluginName)}={acceptPluginName}");
+								}
 							}
 
 							if (operation == IscCodes.op_cond_accept)
@@ -223,11 +239,11 @@ namespace FirebirdSql.Data.Client.Managed
 								{
 									await Xdr.Write(IscCodes.op_crypt, async).ConfigureAwait(false);
 									await Xdr.Write(FirebirdNetworkHandlingWrapper.EncryptionName, async).ConfigureAwait(false);
-									await Xdr.Write(SrpClient.SessionKeyName, async).ConfigureAwait(false);
+									await Xdr.Write(sessionKeyName, async).ConfigureAwait(false);
 									await Xdr.Flush(async).ConfigureAwait(false);
 
 									// after writing before reading
-									_firebirdNetworkHandlingWrapper.StartEncryption(srp.SessionKey);
+									_firebirdNetworkHandlingWrapper.StartEncryption(sessionKey);
 
 									var response2 = await ProcessOperation(await Xdr.ReadOperation(async).ConfigureAwait(false), Xdr, async).ConfigureAwait(false);
 									ProcessResponse(response2);
@@ -306,12 +322,9 @@ namespace FirebirdSql.Data.Client.Managed
 			return addresses[0];
 		}
 
-		private (byte[], SrpClient, SspiHelper) UserIdentificationData()
+		private byte[] UserIdentificationData(Srp256Client srp256, SrpClient srp, SspiHelper sspi)
 		{
-			var srp = default(SrpClient);
-			var sspi = default(SspiHelper);
-
-			using (var result = new MemoryStream())
+			using (var result = new MemoryStream(1024))
 			{
 				var userString = Environment.GetEnvironmentVariable("USERNAME") ?? Environment.GetEnvironmentVariable("USER") ?? string.Empty;
 				var user = Encoding.UTF8.GetBytes(userString);
@@ -329,23 +342,28 @@ namespace FirebirdSql.Data.Client.Managed
 
 				if (!string.IsNullOrEmpty(_userID))
 				{
-					srp = new SrpClient();
-
 					var login = Encoding.UTF8.GetBytes(_userID);
 					result.WriteByte(IscCodes.CNCT_login);
 					result.WriteByte((byte)login.Length);
 					result.Write(login, 0, login.Length);
 
-					var pluginName = Encoding.ASCII.GetBytes(SrpClient.PluginName);
-					result.WriteByte(IscCodes.CNCT_plugin_name);
-					result.WriteByte((byte)pluginName.Length);
-					result.Write(pluginName, 0, pluginName.Length);
-					result.WriteByte(IscCodes.CNCT_plugin_list);
-					result.WriteByte((byte)pluginName.Length);
-					result.Write(pluginName, 0, pluginName.Length);
+					void WriteSrpPlugin(string pluginName, string publicKey)
+					{
+						var pluginNameBytes = Encoding.ASCII.GetBytes(pluginName);
+						result.WriteByte(IscCodes.CNCT_plugin_name);
+						result.WriteByte((byte)pluginNameBytes.Length);
+						result.Write(pluginNameBytes, 0, pluginNameBytes.Length);
+						var specificData = Encoding.ASCII.GetBytes(publicKey);
+						WriteMultiPartHelper(result, IscCodes.CNCT_specific_data, specificData);
+					}
+					WriteSrpPlugin(srp256.PluginName, srp256.PublicKeyHex);
+					//WriteSrpPlugin(srp.PluginName, srp.PublicKeyHex);
 
-					var specificData = Encoding.ASCII.GetBytes(srp.PublicKeyHex);
-					WriteMultiPartHelper(result, IscCodes.CNCT_specific_data, specificData);
+					var plugins = string.Join(",", srp256.PluginName/*, srp.PluginName*/);
+					var pluginsBytes = Encoding.ASCII.GetBytes(plugins);
+					result.WriteByte(IscCodes.CNCT_plugin_list);
+					result.WriteByte((byte)pluginsBytes.Length);
+					result.Write(pluginsBytes, 0, pluginsBytes.Length);
 
 					result.WriteByte(IscCodes.CNCT_client_crypt);
 					result.WriteByte(4);
@@ -353,8 +371,6 @@ namespace FirebirdSql.Data.Client.Managed
 				}
 				else
 				{
-					sspi = new SspiHelper();
-
 					var pluginName = Encoding.ASCII.GetBytes(SspiHelper.PluginName);
 					result.WriteByte(IscCodes.CNCT_plugin_name);
 					result.WriteByte((byte)pluginName.Length);
@@ -371,7 +387,7 @@ namespace FirebirdSql.Data.Client.Managed
 					result.Write(TypeEncoder.EncodeInt32(IscCodes.WIRE_CRYPT_DISABLED), 0, 4);
 				}
 
-				return (result.ToArray(), srp, sspi);
+				return result.ToArray();
 			}
 		}
 
